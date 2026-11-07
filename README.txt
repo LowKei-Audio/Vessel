@@ -167,12 +167,12 @@ To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/is
 
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 /DBuildDir=..\build installer\Vessel.iss
 
-The installer is written to installer\Output\. Pushing a tag such as v1.0.0 makes CI build it and publish a GitHub Release automatically. The tag must match the version in CMakeLists.txt.
+The installer is written to installer\Output\. To publish a release, either push a tag such as v1.0.0 (it must match the version in CMakeLists.txt), or push the commit to the release branch: CI builds and verifies it, then creates the v<version> tag and the GitHub Release itself (it refuses a version that is already released).
 
 Verification
 ~~~~~~~~~~~~
 
-The Build workflow runs on pushes to dev, on version tags and on demand (not on main, to save Actions minutes: main only receives commits that already passed on dev). A run only passes if all of the following pass:
+The Build workflow runs on pushes to dev and release, on version tags and on demand (not on main, to save Actions minutes: main only receives commits that already passed). A run only passes if all of the following pass:
 
   DSP tests (vessel_tests):  Note and Chord tuning land on the right frequencies; white noise comes out peaked at the tuned modes; Fill lowers the vessel by the right amount; Seal holds the ring while an open vessel dies away; every material and tuning stays finite and bounded at extreme settings; Pour drive keeps its level; Fracture, Echo and Liquid stay bounded; all stages off is bit-exact; switching stages never clicks; the Echo Return loop at maximum always decays; the limiter holds its ceiling; CPU with every stage on (about 3% of one core measured).
   State checks (vessel_check state):  Save/restore of parameters and the matrix (byte-identical on reload); Shatter and macros reaching the engines; Seal holding the ring in the real processor; undo; 25 random vessels all safe; preset data integrity.

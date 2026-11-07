@@ -180,11 +180,11 @@ To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/is
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 /DBuildDir=..\build installer\Vessel.iss
 ```
 
-The installer is written to `installer\Output\`. Pushing a tag such as `v1.0.0` makes CI build it and publish a GitHub Release automatically. The tag must match the version in `CMakeLists.txt`.
+The installer is written to `installer\Output\`. To publish a release, either push a tag such as `v1.0.0` (it must match the version in `CMakeLists.txt`), or push the commit to the `release` branch: CI builds and verifies it, then creates the `v<version>` tag and the GitHub Release itself (it refuses a version that is already released).
 
 ### Verification
 
-The **Build** workflow runs on pushes to `dev`, on version tags and on demand (not on `main`, to save Actions minutes: `main` only receives commits that already passed on `dev`). A run only passes if all of the following pass:
+The **Build** workflow runs on pushes to `dev` and `release`, on version tags and on demand (not on `main`, to save Actions minutes: `main` only receives commits that already passed). A run only passes if all of the following pass:
 
 | Check | What it proves |
 |---|---|
