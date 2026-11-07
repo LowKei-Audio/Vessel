@@ -1,0 +1,221 @@
+# Builds Vessel for Windows, verifies it, and publishes the plugin as a
+# downloadable artifact. A run only goes green if every check passes:
+#   1. DSP unit tests (engines, chain, stability, clicks, CPU)
+#   2. Patch/state checks (save/restore, Shatter, Seal, undo, randomizer)
+#   3. Every factory preset rendered as saved, with Shatter and with macros maxed
+#   4. pluginval at strictness 10 (host-compatibility torture test)
+#   5. Steinberg's official VST3 validator
+#   6. clap-validator, the official CLAP conformance suite
+# Each check also posts its headline result as an annotation on the run page.
+# After the checks, it builds the Inno Setup installer. Pushing a version tag
+# (v1.0.0) also publishes a GitHub Release with the installer attached.
+#
+# To keep Actions minutes down it runs only on the dev branch, version tags and
+# by hand (main only ever receives commits that already passed on dev), and it
+# caches both validators between runs.
+name: Build
+
+on:
+  push:
+    branches: [dev]
+    tags: ['v*']
+  workflow_dispatch:
+
+# contents: write lets the tag build create the GitHub Release.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGINVAL_VERSION: v1.0.4
+  VST3SDK_TAG: v3.8.1_build_84
+  CLAP_VALIDATOR_TAG: 0.4.1  # 0.3.x no longer compiles on current Rust (same pin as Compass)
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # ---------------------------------------------------------------- build
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build plugin, tests and checker
+        run: >
+          cmake --build build --config Release --parallel
+          --target Vessel_VST3 Vessel_CLAP Vessel_Standalone vessel_tests vessel_check
+
+      # ---------------------------------------------------------------- verify
+      # Proves the static-runtime claim: the plugin must not need VCRUNTIME/MSVCP DLLs.
+      - name: Check plugin DLL dependencies
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object FullName -like '*Hostx64\x64*' | Select-Object -First 1
+          $vst3 = Get-ChildItem "build/src/Vessel_artefacts/Release/VST3/Vessel.vst3" -Recurse -Filter Vessel.vst3 -File | Select-Object -First 1
+          $clap = Get-Item "build/src/Vessel_artefacts/Release/CLAP/Vessel.clap"
+          foreach ($bin in @($vst3, $clap)) {
+            $deps = & $dumpbin.FullName /dependents $bin.FullName
+            $deps
+            $dlls = ($deps | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }) -join ', '
+            Write-Output "::notice title=$($bin.Extension) DLL dependencies::$dlls"
+            if ($deps -match 'VCRUNTIME|MSVCP') { Write-Error "$($bin.Name) depends on the Visual C++ runtime DLLs"; exit 1 }
+          }
+
+      - name: DSP tests
+        run: |
+          ./build/Release/vessel_tests.exe | tee tests.log
+          echo "::notice title=DSP tests::$(grep -E 'All tests passed|test cases' tests.log | tail -1) | $(grep -E 'of one core' tests.log | sed 's/^ *//')"
+
+      - name: Patch and state checks
+        run: |
+          ./build/vessel_check_artefacts/Release/vessel_check.exe state | tee state.log
+          echo "::notice title=State checks::$(tail -1 state.log)"
+
+      - name: Factory preset audio check
+        run: |
+          ./build/vessel_check_artefacts/Release/vessel_check.exe presets | tee presets.log
+          echo "::notice title=Factory presets::$(grep 'preset(s) failed' presets.log)"
+
+      - name: UI snapshots (Windows font rendering)
+        run: |
+          mkdir -p screenshots
+          C=./build/vessel_check_artefacts/Release/vessel_check.exe
+          $C snapshot screenshots/easy-1200.png 1200 easy 28
+          $C snapshot screenshots/shatter-1200.png 1200 easy-shatter 33
+          $C snapshot screenshots/seal-1200.png 1200 easy-seal 2
+          $C snapshot screenshots/vessel-1200.png 1200 vessel 7
+          $C snapshot screenshots/fx-1200.png 1200 fx 46
+          $C snapshot screenshots/mod-1200.png 1200 mod 8
+          $C snapshot screenshots/global-1200.png 1200 global 8
+          $C snapshot screenshots/easy-840.png 840 easy 1
+
+      - name: pluginval (strictness 10)
+        run: |
+          curl -sSfL -o pluginval.zip "https://github.com/Tracktion/pluginval/releases/download/${PLUGINVAL_VERSION}/pluginval_Windows.zip"
+          7z x -y pluginval.zip > /dev/null
+          ./pluginval.exe --strictness-level 10 --verbose --validate-in-process \
+            --output-dir pluginval-logs "build/src/Vessel_artefacts/Release/VST3/Vessel.vst3"
+          echo "::notice title=pluginval::Strictness 10 passed (all test groups)"
+
+      # clap-validator exits non-zero if any conformance test fails. Built from
+      # source with cargo at a pinned tag (same as the rest of the family) and
+      # cached, so only the first run pays for the Rust build.
+      - name: Cache clap-validator
+        id: cache-clap
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/clap-validator.exe
+          key: clap-validator-${{ env.CLAP_VALIDATOR_TAG }}-windows
+
+      - name: clap-validator
+        shell: pwsh
+        run: |
+          if ("${{ steps.cache-clap.outputs.cache-hit }}" -ne "true") {
+            cargo install --locked --git https://github.com/free-audio/clap-validator --tag $env:CLAP_VALIDATOR_TAG clap-validator
+          }
+          clap-validator validate "build/src/Vessel_artefacts/Release/CLAP/Vessel.clap" | Tee-Object -FilePath clap-validator.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            # On a state-reproducibility-binary failure, print what differed: the
+            # saved states are JUCE binary XML (8-byte header, then XML text).
+            Get-ChildItem (Join-Path $env:TEMP 'clap-validator') -Recurse -Filter 'state-expected' -ErrorAction SilentlyContinue | ForEach-Object {
+              $decode = { param($f) [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($f), 8, ([IO.File]::ReadAllBytes($f).Length - 8)).TrimEnd([char]0) -replace '><', ">`n<" -replace '" ', "`"`n " }
+              & $decode $_.FullName | Set-Content -Encoding utf8 expected.xml
+              & $decode (Join-Path $_.DirectoryName 'state-actual') | Set-Content -Encoding utf8 actual.xml
+              Write-Output "=== State diff for $($_.Directory.Name) (expected vs actual) ==="
+              git diff --no-index --no-color -U1 expected.xml actual.xml
+            }
+            exit $code
+          }
+          $summary = Select-String -Path clap-validator.log -Pattern 'tests run' | Select-Object -Last 1
+          if ($summary) { Write-Output "::notice title=clap-validator::$($summary.Line.Trim())" }
+
+      - name: Cache Steinberg VST3 validator
+        id: cache-validator
+        uses: actions/cache@v6
+        with:
+          path: validator
+          key: vst3-validator-${{ env.VST3SDK_TAG }}-windows
+
+      - name: Build Steinberg VST3 validator
+        if: steps.cache-validator.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 --branch "${VST3SDK_TAG}" --recurse-submodules --shallow-submodules \
+            https://github.com/steinbergmedia/vst3sdk.git vst3sdk
+          cmake -S vst3sdk -B vst3sdk/build -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF \
+            -DSMTG_ADD_VST3_PLUGINS_SAMPLES=OFF -DSMTG_ADD_VST3_HOSTING_SAMPLES=ON -DSMTG_RUN_VST_VALIDATOR=OFF
+          cmake --build vst3sdk/build --config Release --target validator --parallel
+          mkdir -p validator
+          cp vst3sdk/build/bin/Release/validator.exe validator/
+
+      # Run on the bundle folder directly: the 3.8 validator rejects the inner
+      # binary path that pluginval would pass it.
+      - name: Steinberg VST3 validator
+        run: |
+          ./validator/validator.exe "build/src/Vessel_artefacts/Release/VST3/Vessel.vst3" | tee validator.log
+          echo "::notice title=Steinberg VST3 validator::$(grep -E '^Result:' validator.log | tail -1)"
+
+      # ---------------------------------------------------------------- package
+      # A release tag must match the CMake project version, so the installer
+      # name, the About text and the tag can never disagree.
+      - name: Read version
+        id: version
+        run: |
+          v=$(sed -nE 's/^project\(Vessel VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::Tag ${GITHUB_REF#refs/tags/} does not match CMake version $v"; exit 1
+          fi
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.value }}" "/DBuildDir=..\build" installer\Vessel.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem installer\Output\*.exe | Select-Object -First 1
+          Write-Output "::notice title=Installer::$($exe.Name) ($([math]::Round($exe.Length / 1MB, 1)) MB)"
+
+      # ---------------------------------------------------------------- publish
+      # One download with everything: installer, plus the raw VST3 bundle, CLAP
+      # file and standalone app for anyone who prefers to copy files by hand.
+      - name: Upload installer, VST3, CLAP and Standalone
+        uses: actions/upload-artifact@v7
+        with:
+          name: Vessel-Windows-x64
+          path: |
+            installer/Output/*.exe
+            build/src/Vessel_artefacts/Release/VST3/
+            build/src/Vessel_artefacts/Release/CLAP/Vessel.clap
+            build/src/Vessel_artefacts/Release/Standalone/Vessel.exe
+
+      - name: Publish release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Vessel ${{ steps.version.outputs.value }}
+          files: installer/Output/*.exe
+          generate_release_notes: true
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Vessel-verification
+          path: |
+            screenshots/
+            pluginval-logs/
+            *.log
+          if-no-files-found: ignore
