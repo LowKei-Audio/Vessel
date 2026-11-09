@@ -9,14 +9,16 @@ Vessel is a resonant-body effect from LowKei Audio. Whatever you feed it (drums,
 - Hosts: Serato Studio, FL Studio and Ableton Live load the VST3. FL Studio, Bitwig Studio and Reaper also load the CLAP.
 - Views: Easy (play every preset in seconds) and Pro (every stage, the modulation matrix and global settings).
 - Presets: 51 factory presets in 11 categories, each with its four macros assigned.
-- Version: 1.0.0
+- Version: 1.0.1
+
+1.0.1 improves stability when your DAW saves or loads a project while Vessel is open. Some hosts do this in the background, and in rare cases it could crash the plug-in. Your projects and presets are unchanged.
 
 
 
 INSTALL (WINDOWS)
 -----------------
 
-1. Download Vessel-1.0.0-Windows-Setup.exe from the repository's Releases page.
+1. Download Vessel-1.0.1-Windows-Setup.exe from the repository's Releases page.
 2. Run it and choose VST3 and CLAP plug-ins and standalone app or Plug-ins only. The installer places the VST3 in C:\Program Files\Common Files\VST3 and the CLAP in C:\Program Files\Common Files\CLAP, the standard folders every supported DAW scans, and adds Start menu shortcuts for the app and this guide.
 3. Rescan in your DAW:
 
@@ -165,9 +167,9 @@ The plugins are written to build/src/Vessel_artefacts/Release/VST3/ and .../Rele
 
 To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then from the repository root:
 
-    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 /DBuildDir=..\build installer\Vessel.iss
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DBuildDir=..\build installer\Vessel.iss
 
-The installer is written to installer\Output\. To publish a release, either push a tag such as v1.0.0 (it must match the version in CMakeLists.txt), or push the commit to the release branch: CI builds and verifies it, then creates the v<version> tag and the GitHub Release itself (it refuses a version that is already released).
+The installer is written to installer\Output\. To publish a release, either push a tag such as v1.0.1 (it must match the version in CMakeLists.txt), or push the commit to the release branch: CI builds and verifies it, then creates the v<version> tag and the GitHub Release itself (it refuses a version that is already released).
 
 Verification
 ~~~~~~~~~~~~
