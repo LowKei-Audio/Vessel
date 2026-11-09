@@ -40,6 +40,11 @@ VesselProcessor::VesselProcessor()
     apvts.state.addListener (this);
     refreshFromState();
 
+    // A loaded state: audio-side data at once from the incoming tree, then the live
+    // tree's structure once stateGuard has put it in place on the message thread.
+    stateGuard.onDeferredLoad = [this] (const ValueTree& t) { refreshFrom (t); };
+    stateGuard.onApplied = [this] { ensureStateStructure(); refreshFromState(); };
+
     presets.load (0);            // start on the Init preset
     undo.clearUndoHistory();     // loading Init is not an undoable edit
 }
@@ -101,9 +106,9 @@ void VesselProcessor::ensureStateStructure()
 
 ValueTree VesselProcessor::matrixTree() const { return apvts.state.getChildWithName (kMatrixType); }
 
-void VesselProcessor::refreshFromState()
+void VesselProcessor::refreshFrom (const ValueTree& st)
 {
-    const auto m = matrixTree();
+    const auto m = st.getChildWithName (kMatrixType);
     for (int i = 0; i < kMatrixSlots; ++i)
     {
         const auto s = m.getChild (i);
@@ -184,18 +189,17 @@ void VesselProcessor::setParamReal (int i, float real)
 
 ValueTree VesselProcessor::getPatchState() const
 {
-    return const_cast<AudioProcessorValueTreeState&> (apvts).copyState();   // copyState flushes params; logically const
+    return stateGuard.getState();   // safe from any thread (a host may save off the message thread)
 }
 
 void VesselProcessor::applyPatchState (const ValueTree& src, bool notifyHost)
 {
-    if (! src.hasType (apvts.state.getType())) return;
+    if (! src.hasType (stateGuard.stateType())) return;
 
     if (! notifyHost)
     {
-        apvts.replaceState (src.createCopy());
-        ensureStateStructure();
-        refreshFromState();
+        // Parameters now; the tree on the message thread (see stateGuard hooks).
+        stateGuard.setState (src);
         return;
     }
 
@@ -251,7 +255,7 @@ void VesselProcessor::getStateInformation (MemoryBlock& destData)
 void VesselProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (apvts.state.getType()))
+        if (xml->hasTagName (stateGuard.stateType()))
         {
             applyPatchState (ValueTree::fromXml (*xml), false);
             updateHostDisplay (ChangeDetails().withProgramChanged (true));
