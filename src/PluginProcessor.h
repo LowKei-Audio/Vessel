@@ -13,6 +13,7 @@
 #include "dsp/ModSources.h"
 #include "dsp/OutputStage.h"
 #include "presets/PresetManager.h"
+#include "state/StateGuard.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -64,6 +65,7 @@ public:
     // Patch data (message thread) -------------------------------------------------------
     juce::UndoManager undo;
     juce::AudioProcessorValueTreeState apvts;
+    mutable lowkei::StateGuard stateGuard { apvts };   // host save/load off the message thread
 
     MatrixSlot getSlot (int i) const;
     void setSlot (int i, const MatrixSlot& s);
@@ -76,6 +78,7 @@ public:
     void applyPatchState (const juce::ValueTree& tree, bool notifyHost);
 
     PresetManager presets { *this };
+
 
     // Panic: clears every tail, buffer and the echo return on the next block.
     void requestKill() noexcept { killRequested.store (true); }
@@ -106,7 +109,8 @@ private:
     void valueTreeRedirected (juce::ValueTree&) override { refreshFromState(); }
 
     void ensureStateStructure();
-    void refreshFromState();
+    void refreshFromState() { refreshFrom (apvts.state); }
+    void refreshFrom (const juce::ValueTree& st);   // the live tree, or a state being loaded
     juce::ValueTree matrixTree() const;
     void setParamReal (int i, float real);
 
