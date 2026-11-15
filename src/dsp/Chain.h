@@ -46,8 +46,22 @@ public:
         for (auto* m : modules()) m->prepare (sampleRate, kMaxBlock);
         for (auto& s : onS) s.prepare (sampleRate, 12.0f);
         primed = false;
+        sloshGlide.reset();
+        clockPrimed = false;
         reset();
     }
+
+    // A sound change is fading the input out and back in: onset detectors hold
+    // (1, fading out) or hold and follow upward (2, from the swap through the fade-in).
+    void setDetectorMode (int mode) noexcept
+    {
+        pourE.setDetectorMode (mode);
+        bodyE.setDetectorMode (mode);
+        fractureE.setHoldCracks (mode != 0);
+    }
+
+    // The host playhead jumped over sound: ease the synced slosh onto the new position.
+    void armGlide() noexcept { sloshGlide.arm(); }
 
     void reset()
     {
@@ -70,20 +84,33 @@ public:
     // Liquid clock at the start of the next block, and its per-sample step.
     void clock (const Transport& t, int n, float& phase, float& inc) noexcept
     {
+        // Sync switched on or off, or a new division: carry on from where the slosh was
+        // heading instead of jumping to the new clock's phase (a jump retunes the ringing
+        // body and the ripple chorus in one sample, heard as a click, Nov 2026).
+        const bool changed = clockPrimed && (params.liquidSync != lastSync
+                                             || (params.liquidSync && params.liquidDivision != lastDivision));
         if (params.liquidSync)
         {
+            if (changed) sloshGlide.continueFrom (lastEnd);
             const double beats = divisionBeats (params.liquidDivision);
-            const double pos = t.ppq / beats;
+            double incD = 0.0;
+            const double pos = sloshGlide.process (t.ppq / beats, t.beatsPerSample() / beats, n, fs, incD);
             phase = (float) (pos - std::floor (pos));
-            inc = (float) (t.beatsPerSample() / beats);
+            inc = (float) incD;
         }
         else
         {
+            sloshGlide.reset();
+            if (changed) freePhase = lastEnd - std::floor (lastEnd);
             inc = std::clamp (params.liquidRateHz, 0.01f, 20.0f) / (float) fs;
             phase = (float) freePhase;
             freePhase += (double) inc * n;
             freePhase -= std::floor (freePhase);
         }
+        lastSync = params.liquidSync;
+        lastDivision = params.liquidDivision;
+        lastEnd = (double) phase + (double) inc * n;
+        clockPrimed = true;
     }
 
     // n <= kMaxBlock. Engines' params must be set before this call.
@@ -139,17 +166,37 @@ private:
         }
         std::copy (L, L + n, dryL.begin());
         std::copy (R, R + n, dryR.begin());
-        m.process (L, R, n, t);
+
+        // The stage's input fades with its output. A stage that wakes up starts with
+        // empty delay lines: fed the full signal at once, a chorus or echo tap reads
+        // silence and then the signal arrives in one step, heard as a click a few ms
+        // after Liquid or Echo is switched on (or a preset turns it on). Faded in, the
+        // lines fill smoothly. Fully on, the gain is exactly 1: nothing changes.
+        std::array<float, kMaxBlock> g {};
+        bool partial = false;
         for (int i = 0; i < n; ++i)
         {
-            const float g = fade.next();
-            L[i] = dryL[(size_t) i] + g * (L[i] - dryL[(size_t) i]);
-            R[i] = dryR[(size_t) i] + g * (R[i] - dryR[(size_t) i]);
+            g[(size_t) i] = fade.next();
+            partial = partial || g[(size_t) i] != 1.0f;
         }
+        if (partial)
+            for (int i = 0; i < n; ++i) { L[i] *= g[(size_t) i]; R[i] *= g[(size_t) i]; }
+
+        m.process (L, R, n, t);
+        if (partial)
+            for (int i = 0; i < n; ++i)
+            {
+                L[i] = dryL[(size_t) i] + g[(size_t) i] * (L[i] - dryL[(size_t) i]);
+                R[i] = dryR[(size_t) i] + g[(size_t) i] * (R[i] - dryR[(size_t) i]);
+            }
         return true;
     }
 
     double fs = 48000.0, freePhase = 0.0;
+    PhaseGlide sloshGlide;
+    double lastEnd = 0.0;          // slosh phase the last block was heading to
+    int lastDivision = 0;
+    bool lastSync = false, clockPrimed = false;
     ChainParams params;
     std::array<Smoother, kStageCount> onS;
     std::array<float, kMaxBlock> dryL {}, dryR {};

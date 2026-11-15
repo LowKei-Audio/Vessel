@@ -8,7 +8,9 @@ Vessel is a resonant-body effect from LowKei Audio. Whatever you feed it (drums,
 - **Hosts:** Serato Studio, FL Studio and Ableton Live load the VST3. FL Studio, Bitwig Studio and Reaper also load the CLAP.
 - **Views:** **Easy** (play every preset in seconds) and **Pro** (every stage, the modulation matrix and global settings).
 - **Presets:** 51 factory presets in 11 categories, each with its four macros assigned.
-- **Version:** 1.0.1
+- **Version:** 1.0.2
+
+**1.0.2** removes the clicks and static heard in Serato Studio when you switch presets, use Pour Me or A/B, or load a project while audio is playing, and when a loop restarts. A sound change now fades briefly to your dry signal, swaps every setting at once and fades the new sound in, all within about 50 ms. Synced movement eases onto the new position when a loop wraps instead of jumping. It also removes clicks when Liquid, Echo, Echo Ping-Pong, Pour Low Cut or Bass Mono are switched while playing. Once a preset settles it sounds the same as before, and your projects and presets are unchanged.
 
 **1.0.1** improves stability when your DAW saves or loads a project while Vessel is open. Some hosts do this in the background, and in rare cases it could crash the plug-in. Your projects and presets are unchanged.
 
@@ -16,7 +18,7 @@ Vessel is a resonant-body effect from LowKei Audio. Whatever you feed it (drums,
 
 ## Install (Windows)
 
-1. Download **Vessel-1.0.1-Windows-Setup.exe** from the repository's **Releases** page.
+1. Download **Vessel-1.0.2-Windows-Setup.exe** from the repository's **Releases** page.
 2. Run it and choose **VST3 and CLAP plug-ins and standalone app** or **Plug-ins only**. The installer places the VST3 in `C:\Program Files\Common Files\VST3` and the CLAP in `C:\Program Files\Common Files\CLAP`, the standard folders every supported DAW scans, and adds Start menu shortcuts for the app and this guide.
 3. Rescan in your DAW:
 
@@ -179,10 +181,10 @@ The plugins are written to `build/src/Vessel_artefacts/Release/VST3/` and `.../R
 To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then from the repository root:
 
 ```
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DBuildDir=..\build installer\Vessel.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.2 /DBuildDir=..\build installer\Vessel.iss
 ```
 
-The installer is written to `installer\Output\`. To publish a release, either push a tag such as `v1.0.1` (it must match the version in `CMakeLists.txt`), or push the commit to the `release` branch: CI builds and verifies it, then creates the `v<version>` tag and the GitHub Release itself (it refuses a version that is already released).
+The installer is written to `installer\Output\`. To publish a release, either push a tag such as `v1.0.2` (it must match the version in `CMakeLists.txt`), or push the commit to the `release` branch: CI builds and verifies it, then creates the `v<version>` tag and the GitHub Release itself (it refuses a version that is already released).
 
 ### Verification
 
@@ -190,8 +192,9 @@ The **Build** workflow runs on pushes to `dev` and `release`, on version tags an
 
 | Check | What it proves |
 |---|---|
-| DSP tests (`vessel_tests`) | Note and Chord tuning land on the right frequencies; white noise comes out peaked at the tuned modes; Fill lowers the vessel by the right amount; Seal holds the ring while an open vessel dies away; every material and tuning stays finite and bounded at extreme settings; Pour drive keeps its level; Fracture, Echo and Liquid stay bounded; all stages off is bit-exact; switching stages never clicks; the Echo Return loop at maximum always decays; the limiter holds its ceiling; CPU with every stage on (about 3% of one core measured). |
+| DSP tests (`vessel_tests`) | Note and Chord tuning land on the right frequencies; white noise comes out peaked at the tuned modes; Fill lowers the vessel by the right amount; Seal holds the ring while an open vessel dies away; every material and tuning stays finite and bounded at extreme settings; Pour drive keeps its level; Fracture, Echo and Liquid stay bounded; all stages off is bit-exact; switching stages never clicks; the Echo Return loop at maximum always decays; the limiter holds its ceiling; CPU with every stage on (about 3% of one core measured). Static regression tests (`StaticTests.cpp`): one per cause of the 1.0.1 clicks, each failing on 1.0.1. |
 | State checks (`vessel_check state`) | Save/restore of parameters and the matrix (byte-identical on reload); Shatter and macros reaching the engines; Seal holding the ring in the real processor; undo; 25 random vessels all safe; preset data integrity. |
+| Static check (`vessel_check static`) | No clicks or static, measured on the real plug-in over a held tone: every factory preset, six Pour Me patches, A/B and a project load switched while playing (never sharper than either sound on its own); every preset through a loop wrap and a restart over sound; SEAL and SHATTER pressed and released on every preset; a sound change complete within 64 ms (50.7 ms measured). Vessel 1.0.1 fails it (up to 148x on preset switches, 300x on a loop). |
 | Preset check (`vessel_check presets`) | Every factory preset as saved, with Shatter engaged and with all four macros at 100%: finite, under the ceiling, within a sane level of dry, with decaying tails. |
 | pluginval, strictness 10 | State save/restore, automation, thread safety, parameter fuzzing and bus layouts. |
 | Steinberg VST3 validator | Official VST3 conformance. |
@@ -209,8 +212,9 @@ src/presets/        51 factory presets, macro kit, preset manager and randomizer
 src/ui/             Look and feel, controls, the animated vessel, Easy / Pro views
 src/Parameters*     Every parameter defined once in a table
 src/Plugin*.cpp     JUCE processor (control blocks, matrix, Shatter) and editor
-tests/              Catch2 engine and chain tests
-tools/Check.cpp     Headless state checks, preset audio check and UI snapshots
+tests/              Catch2 engine, chain and static (click) regression tests
+tools/Check.cpp     Headless state checks, preset audio check, static (click) check
+                    and UI snapshots
 tools/make_docs.py  Regenerates README.txt and docs/README.pdf
 installer/          Inno Setup script for the Windows installer (built by CI)
 resources/fonts/    Embedded Barlow Semi Condensed (SIL OFL 1.1)

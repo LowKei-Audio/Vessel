@@ -19,6 +19,7 @@
 #include "Module.h"
 
 #include <array>
+#include <utility>
 
 namespace vessel::dsp
 {
@@ -67,6 +68,11 @@ public:
         aSlow = std::exp (-1.0f / (0.040f * fs));
         rSlow = std::exp (-1.0f / (0.200f * fs));
         powCoeff = std::exp (-1.0f / (0.6f * fs));
+        guardRel = std::exp (-1.0f / (0.1f * fs));
+        guardDown = 1.0f - std::exp (-1.0f / (0.015f * fs));
+        guardSamples = (int) (0.5f * fs);
+        guardLeft = 0;
+        guardIn = guardOut = 0.0f;
         agcDown = 1.0f - std::exp (-1.0f / (0.12f * fs));
         agcUp = 1.0f - std::exp (-1.0f / (0.5f * fs));
         for (int k = 0; k < kMaxModes; ++k) drift[(size_t) k].prepare (sampleRate / 32.0);
@@ -105,7 +111,12 @@ public:
         const float fillMul = 1.0f / std::sqrt (1.0f + 1.8f * p.fill * p.fill);
         const float warp = 1.0f + 0.22f * std::clamp (p.inharm, -1.0f, 1.0f);
         const float bright = std::clamp (p.brightness + mat.brightBias, -1.5f, 1.5f);
-        const float glideCoeff = p.glideMs <= 0.5f || ! primed ? 1.0f
+        // Right after a sound change (beginSoundChange) the modes jump to the new tuning:
+        // the output is fully dry then, and each mode keeps its state, so the ring stays
+        // continuous. Gliding there instead swept the modes through the held input and
+        // rang them up to 3x louder for ~50 ms, into the ceiling (Nov 2026).
+        const bool jumpTuning = std::exchange (tuningJumpPending, false);
+        const float glideCoeff = p.glideMs <= 0.5f || ! primed || jumpTuning ? 1.0f
                                  : 1.0f - std::exp (-(float) blockLen / (0.001f * p.glideMs * fs));
         const int active = std::clamp (p.modes, 1, kMaxModes);
 
@@ -154,6 +165,21 @@ public:
         primed = true;
     }
 
+    // During a sound change the input fades out and back in. Mode 1 (fading out): the
+    // slow envelope holds. Mode 2 (from the swap through the fade-in): it may also rise
+    // with the fast one. Transients excitation then never hears the return as a new
+    // hit, even when the new preset's Pour stage makes it louder (it struck the body on
+    // preset changes, Nov 2026). Noise excitation always follows the input.
+    void setDetectorMode (int mode) noexcept { detectorMode = mode; }
+
+    // A new sound has just been swapped in. Auto level listens over ~0.6 s, so a new
+    // body that rings louder than the old one plays at the old gain for 100+ ms: up to
+    // twice its level, into the soft ceiling and the limiter, heard as crackle after a
+    // preset change (Nov 2026). For the next 0.5 s a peak guard turns the body down
+    // (~15 ms) whenever it runs more than 6 dB over the input. It only ever turns down,
+    // and it is off the rest of the time, so a settled preset sounds exactly as before.
+    void beginSoundChange() noexcept { guardLeft = guardSamples; guardIn = guardOut = 0.0f; tuningJumpPending = true; }
+
     void process (float* L, float* R, int n, const Transport&) noexcept override
     {
         float* io[2] = { L, R };
@@ -175,7 +201,10 @@ public:
                 const float x = io[c][i];
                 const float a = std::abs (x);
                 envFast[c] = a > envFast[c] ? a + aFast * (envFast[c] - a) : a + rFast * (envFast[c] - a);
-                envSlow[c] = a > envSlow[c] ? a + aSlow * (envSlow[c] - a) : a + rSlow * (envSlow[c] - a);
+                if (detectorMode == 0)
+                    envSlow[c] = a > envSlow[c] ? a + aSlow * (envSlow[c] - a) : a + rSlow * (envSlow[c] - a);
+                else if (detectorMode == 2)
+                    envSlow[c] = std::max (envSlow[c], envFast[c]);   // after the swap: may only rise
                 switch (params.excite)
                 {
                     case ExciteMode::input: ex[c] = x; break;
@@ -222,6 +251,17 @@ public:
                 agc += (target < agc ? agcDown : agcUp) * (target - agc);
             }
 
+            // Overshoot guard, only for 0.5 s after a sound change (beginSoundChange):
+            // the body's peak may not run more than 6 dB over the input's peak.
+            if (guardLeft > 0)
+            {
+                --guardLeft;
+                const float pkIn = std::sqrt (pin), pkOut = std::max (std::abs (yl), std::abs (yr)) * agc;
+                guardIn = std::max (pkIn, guardIn * guardRel);
+                guardOut = std::max (pkOut, guardOut * guardRel);
+                if (guardOut > 2.0f * guardIn + 1.0e-6f)
+                    agc += guardDown * (agc * (2.0f * guardIn) / guardOut - agc);
+            }
             const float bl = bodyCeiling (yl * agc), br = bodyCeiling (yr * agc);
             blockEnergy = std::max (blockEnergy, std::max (std::abs (bl), std::abs (br)));
             // Near equal-power blend (the body is mostly uncorrelated with its
@@ -281,6 +321,10 @@ private:
     std::array<Drift, kMaxModes> drift;
     DcBlocker dc[2];
     MixSmoother mixS;
+    int detectorMode = 0;
+    float guardRel = 0.999f, guardDown = 0.001f, guardIn = 0.0f, guardOut = 0.0f;
+    int guardSamples = 24000, guardLeft = 0;
+    bool tuningJumpPending = false;
     Smoother sealS;
     Noise noise;
     float envFast[2] {}, envSlow[2] {};

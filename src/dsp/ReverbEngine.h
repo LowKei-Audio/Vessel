@@ -58,9 +58,12 @@ public:
         revLen = (int) (0.5f * fs);
         for (auto& r : revBuf) r.assign ((size_t) (2.0f * fs) + 16, 0.0f);
         gateS.prepare (sampleRate, 8.0f);
-        for (auto* s : { &sizeS, &fbS, &shimS, &modS, &preS, &freezeS })
+        for (auto* s : { &sizeS, &fbS, &shimS, &modS, &preS, &freezeS, &decayS })
             s->prepare (sampleRate, 60.0f);
         mixS.prepare (sampleRate);
+        inRamp = 1.0f;
+        inRampStep = 1.0f / (0.010f * fs);
+        jumpPending = false;
         primed = false;
         reset();
     }
@@ -82,9 +85,16 @@ public:
 
     void setParams (const ReverbParams& p) noexcept
     {
+        const bool newRoom = jumpPending && primed
+                             && (p.mode != params.mode
+                                 || std::abs (0.25f + 0.75f * clamp01 (p.size) - sizeS.getCurrent()) > 0.01f
+                                 || std::abs (std::clamp (p.predelayMs, 0.0f, 250.0f) * 0.001f * fs - preS.getCurrent()) > 1.0f);
+        jumpPending = false;
         params = p;
         sizeS.setTarget (0.25f + 0.75f * clamp01 (p.size));
-        decay = std::clamp (p.decaySec, 0.2f, 20.0f);
+        // Smoothed: a step in the feedback gains of a ringing tail clicks (a preset that
+        // changes Decay did, Nov 2026). Log domain, so 0.2 s -> 20 s moves evenly.
+        decayS.setTarget (std::log (std::clamp (p.decaySec, 0.2f, 20.0f)));
         shimS.setTarget (clamp01 (p.shimmer));
         modS.setTarget (clamp01 (p.modulation));
         preS.setTarget (std::clamp (p.predelayMs, 0.0f, 250.0f) * 0.001f * fs);
@@ -94,12 +104,26 @@ public:
         for (auto& h : lowcut) h.setCutoff (std::clamp (p.lowCutHz, 20.0f, 1000.0f));
         revLen = std::clamp ((int) ((0.25f + 0.9f * clamp01 (p.size)) * fs), 256, (int) revBuf[0].size() / 2 - 8);
         mixS.set (p.mix, ! primed);
+        if (newRoom)
+        {
+            // Size and pre-delay normally glide, which sweeps the old tail through the
+            // moving delay lines (a rough, pitch-bent burst after a preset change, Nov
+            // 2026). While the output is fully dry, start the new room empty instead and
+            // fade its input in over 10 ms, so its lines fill without a step.
+            for (auto* s : { &sizeS, &preS, &decayS }) s->snapTo (s->getTarget());
+            reset();
+            inRamp = 0.0f;
+        }
         if (! primed)
         {
-            for (auto* s : { &sizeS, &shimS, &modS, &preS, &freezeS }) s->snapTo (s->getTarget());
+            for (auto* s : { &sizeS, &shimS, &modS, &preS, &freezeS, &decayS }) s->snapTo (s->getTarget());
             primed = true;
         }
     }
+
+    // A new sound is being swapped in while the output is fully dry: if the room
+    // changes (mode, size or pre-delay), the next setParams starts it fresh.
+    void jumpOnNextParams() noexcept { jumpPending = true; }
 
     void process (float* L, float* R, int n, const Transport&) noexcept override
     {
@@ -110,11 +134,19 @@ public:
         {
             const float size = sizeS.next(), shim = shimS.next(), mod = modS.next(), preD = preS.next();
             const float frz = freezeS.next();
+            const float logDecay = decayS.next();
             const float mix = mixS.next();
             const float xl = io[0][i], xr = io[1][i];
 
             // Pre-delay and input diffusion (on a mid/side-ish pair).
-            pre[0].push (xl); pre[1].push (xr);
+            float il = xl, ir = xr;
+            if (inRamp < 1.0f)
+            {
+                inRamp = std::min (1.0f, inRamp + inRampStep);
+                const float g = inRamp * inRamp * (3.0f - 2.0f * inRamp);
+                il *= g; ir *= g;
+            }
+            pre[0].push (il); pre[1].push (ir);
             float a = pre[0].read (std::max (2.0f, preD)) * (1.0f - frz);
             float b = pre[1].read (std::max (2.0f, preD)) * (1.0f - frz);
             static constexpr float dl[4] = { 3.1f, 4.7f, 7.9f, 11.3f };
@@ -143,8 +175,11 @@ public:
             // Per-line decay gain for the requested RT60 (frozen = lossless).
             // pow() is costly, so the gains are refreshed every 16 samples.
             if ((counter++ & 15) == 0)
+            {
+                decay = std::exp (logDecay);
                 for (int k = 0; k < kLines; ++k)
                     lineGain[(size_t) k] = std::pow (10.0f, -3.0f * (kBaseLen[k] * size / 48000.0f) / decay);
+            }
             float fbMix[kLines];
             for (int k = 0; k < kLines; ++k)
             {
@@ -232,7 +267,8 @@ private:
     unsigned counter = 0;
     std::array<float, kLines> lineGain {};
     int gateHold = 0, revLen = 24000, revPos = 0;
-    bool revBank = false;
+    bool revBank = false, jumpPending = false;
+    float inRamp = 1.0f, inRampStep = 1.0f / 480.0f;
     ReverbParams params;
     std::array<DelayLine, kLines> lines;
     std::array<OnePole, kLines> damp;
@@ -242,7 +278,7 @@ private:
     std::array<OnePole, 2> lowcut;
     std::array<PitchShifter, 2> shimmerPs;
     std::vector<float> revBuf[2];
-    Smoother sizeS, fbS, shimS, modS, preS, freezeS, gateS;
+    Smoother sizeS, fbS, shimS, modS, preS, freezeS, gateS, decayS;
     MixSmoother mixS;
     bool primed = false;
 };

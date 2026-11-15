@@ -8,6 +8,14 @@
 //                            decay (as saved)
 //   vessel_check state       save/restore round trip, undo, Seal holding,
 //                            preset data integrity, randomizer safety
+//   vessel_check static      clicks and static (Serato report, Nov 2026):
+//                            every preset switch, Pour Me, A/B and project
+//                            load while audio plays; every preset through a
+//                            transport that jumps (loop wrap) and restarts
+//                            over sound; Seal and Shatter toggled over sound
+//   vessel_check static-pair <a> <b>
+//                            diagnostic: one preset switch, then again with
+//                            each stage forced off (not run by CI)
 //
 // Exits non-zero on any failure: CI treats that as a failed build.
 
@@ -16,7 +24,9 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 
 using namespace vessel;
@@ -343,6 +353,568 @@ int snapshot (const juce::String& path, int width, const juce::String& view, int
     std::printf ("%s %s (%dx%d)\n", ok ? "wrote" : "FAILED", path.toRawUTF8(), image.getWidth(), image.getHeight());
     return ok ? 0 : 1;
 }
+
+// ---------------------------------------------------------------------------
+// Static / clicks (Serato report, Nov 2026; same method as Starfire 1.0.4).
+// Metric: the sharpest sample-to-sample bend of the output (|second difference|)
+// near an event, relative to what the sound does on its own. A held soft tone
+// gives ~1; an audible click is well above 2.
+
+// A host transport the test drives block by block.
+struct TestPlayHead : juce::AudioPlayHead
+{
+    double ppq = 0.0, bpm = 120.0;
+    bool playing = false;
+    juce::Optional<PositionInfo> getPosition() const override
+    {
+        PositionInfo i;
+        i.setBpm (bpm);
+        i.setIsPlaying (playing);
+        i.setPpqPosition (ppq);
+        return i;
+    }
+};
+
+// Soft 3-harmonic tone (no sharp edges of its own) with a short fade-in.
+struct SoftTone
+{
+    double ph = 0.0;
+    long n = 0;
+    void fill (juce::AudioBuffer<float>& b)
+    {
+        for (int i = 0; i < b.getNumSamples(); ++i, ++n)
+        {
+            const float v = 0.35f * (float) (std::sin (ph) + 0.4 * std::sin (2 * ph) + 0.2 * std::sin (3 * ph))
+                          * (float) std::min (1.0, (double) n / 240.0);
+            ph += 2.0 * juce::MathConstants<double>::pi * 233.08 / 48000.0;
+            b.setSample (0, i, v);
+            b.setSample (1, i, v);
+        }
+    }
+};
+
+struct Recorder
+{
+    std::vector<float> l, r;
+    void add (const juce::AudioBuffer<float>& b)
+    {
+        l.insert (l.end(), b.getReadPointer (0), b.getReadPointer (0) + b.getNumSamples());
+        r.insert (r.end(), b.getReadPointer (1), b.getReadPointer (1) + b.getNumSamples());
+    }
+    std::vector<float> bend() const
+    {
+        std::vector<float> d (l.size(), 0.0f);
+        for (size_t i = 2; i < l.size(); ++i)
+            d[i] = std::max (std::abs (l[i] - 2 * l[i - 1] + l[i - 2]), std::abs (r[i] - 2 * r[i - 1] + r[i - 2]));
+        return d;
+    }
+};
+
+float sharpest (const std::vector<float>& d, int a, int b)
+{
+    a = std::max (a, 2); b = std::min (b, (int) d.size());
+    return a < b ? *std::max_element (d.begin() + a, d.begin() + b) : 0.0f;
+}
+
+bool verboseStatic() { return std::getenv ("VESSEL_VERBOSE") != nullptr; }
+
+// Sharpest moment a patch makes on its own: rendered alone from a fresh plugin for
+// 1.5 s, measured after the first 0.3 s (its own start-up is not a switch).
+float soloSharpness (const juce::ValueTree& patch)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    const int block = 512, n = 144 * block;
+    proc.prepareToPlay (48000.0, block);
+    proc.applyPatchState (patch.createCopy(), true);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    for (int done = 0; done < n; done += block)
+    {
+        tone.fill (buf);
+        proc.processBlock (buf, midi);
+        rec.add (buf);
+        head.ppq += block * head.bpm / 60.0 / 48000.0;
+    }
+    const auto d = rec.bend();
+    return sharpest (d, 28 * block, n);
+}
+
+// Sound changes while audio plays. Each switch is watched for 250 ms (the fade out,
+// the swap, the fade in and the 150 ms the detectors settle) and compared with the
+// sharpest moment either sound makes on its own (rendered alone from a fresh plugin,
+// and in this run: the old sound's last second, the new one from 0.5 s on) and with
+// the dry input itself, which the switch passes through at the swap. Cracks and
+// grit have sharp edges by design; a switch must never be sharper than that. Steps that
+// an echo or reverb could replay later are covered by StaticTests (Echo jump, routing,
+// Decay).
+int checkSoundChanges (float& worstOut)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    proc.setPlayHead (&head);
+    const int block = 512, segment = 144 * block;   // ~1.5 s per sound
+    proc.prepareToPlay (48000.0, block);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    auto play = [&] (int samples)
+    {
+        for (int done = 0; done < samples; done += block)
+        {
+            tone.fill (buf);
+            proc.processBlock (buf, midi);
+            rec.add (buf);
+            head.ppq += block * head.bpm / 60.0 / 48000.0;
+        }
+    };
+
+    struct Change { int at; juce::String name; juce::ValueTree from, to; };
+    std::vector<Change> changes;
+    auto change = [&] (const juce::String& name, const std::function<void()>& f)
+    {
+        Change c { (int) rec.l.size(), name, proc.getPatchState(), {} };
+        f();
+        c.to = proc.getPatchState();
+        changes.push_back (c);
+        play (segment);
+    };
+
+    head.playing = true;
+    const auto& entries = proc.presets.getEntries();
+    proc.presets.load (0);
+    play (segment);
+    for (int i = 1; i < entries.size(); ++i)
+        if (entries[i].factoryIndex >= 0)
+            change ("preset " + entries[i].name, [&] { proc.presets.load (i); });
+    for (std::uint32_t s = 1; s <= 6; ++s)
+        change ("Pour Me " + juce::String ((int) s), [&] { proc.presets.randomize (s * 101); });
+    proc.presets.load (3);
+    play (segment);
+    proc.presets.copyActiveToOther();
+    proc.presets.selectSlot (1);
+    change ("Pour Me into B", [&] { proc.presets.randomize (77); });
+    change ("A/B to A", [&] { proc.presets.selectSlot (0); });
+    change ("A/B to B", [&] { proc.presets.selectSlot (1); });
+    {
+        VesselProcessor other;   // a project saved with another preset, loaded while playing
+        other.presets.load (entries.size() / 2);
+        juce::MemoryBlock mb;
+        other.getStateInformation (mb);
+        change ("project load", [&] { proc.setStateInformation (mb.getData(), (int) mb.getSize()); });
+    }
+
+    // The dry input itself: the switch passes it through at the swap, which is never a click.
+    float toneSharpness = 0.0f;
+    {
+        SoftTone t2;
+        juce::AudioBuffer<float> b2 (2, 48000);
+        t2.fill (b2);
+        Recorder r2;
+        r2.add (b2);
+        const auto d2 = r2.bend();
+        toneSharpness = sharpest (d2, 480, 48000);
+    }
+
+    const auto d = rec.bend();
+    int fails = 0;
+    float worst = 0.0f;
+    for (const auto& c : changes)
+    {
+        const float ref = std::max ({ toneSharpness, soloSharpness (c.from), soloSharpness (c.to),
+                                      sharpest (d, c.at - 96 * block, c.at - block),
+                                      sharpest (d, c.at + 48 * block, c.at + segment - block) }) + 1.0e-6f;
+        const auto it = std::max_element (d.begin() + c.at - 16, d.begin() + c.at + 24 * block);
+        const float ratio = *it / ref;
+        worst = std::max (worst, ratio);
+        const bool bad = ratio >= 1.25f;
+        fails += bad ? 1 : 0;
+        if (bad || verboseStatic())
+            std::printf ("  %-4s %-40s %6.2f  (%.1f ms)\n", bad ? "FAIL" : "ok", c.name.toRawUTF8(), ratio,
+                         (double) (it - d.begin() - c.at) / 48.0);
+        // Diagnostic: VX_DUMP=<file> VX_DUMP_AT=<change name> writes that change's left
+        // channel (raw float32, from 0.3 s before it) for plotting.
+        if (const char* at = std::getenv ("VX_DUMP_AT"))
+            if (c.name == juce::String (at))
+                if (auto* f = std::fopen (std::getenv ("VX_DUMP"), "wb"))
+                {
+                    std::fwrite (rec.l.data() + c.at - 14400, sizeof (float), 14400 + (size_t) segment, f);
+                    std::fclose (f);
+                }
+    }
+    std::printf ("sound changes: %d of %d clicked, worst %.2f (limit 1.25)\n", fails, (int) changes.size(), worst);
+    worstOut = worst;
+    return fails;
+}
+
+// One preset through a transport that jumps back while playing, as a loop wrap does.
+// The jump (2.37 beats) is deliberately off the grid of every synced division, so
+// a synced LFO or slosh lands somewhere new (a whole-bar loop would hide that for
+// divisions of a bar or less, but a 1-beat loop in Serato against a 1-bar LFO
+// would not). With `gap`, the host also reports "stopped" for the block before
+// the jump, as a restart over sound does.
+// Returns the sharpest bend near the jump relative to a control render of the same
+// preset without the jump (same moment), so a preset's own evolving texture (Tide
+// Pool's random currents) is not mistaken for a loop click.
+std::vector<float> loopRender (int presetIndex, bool jump, bool gap, int at, int total)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    proc.setPlayHead (&head);
+    const int block = 512;
+    proc.prepareToPlay (48000.0, block);
+    proc.presets.load (presetIndex);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    head.ppq = 8.0;
+    for (int pos = 0; pos < total; pos += block)
+    {
+        if (jump && pos == at) head.ppq -= 2.37;
+        head.playing = ! (gap && pos == at - block);
+        tone.fill (buf);
+        proc.processBlock (buf, midi);
+        rec.add (buf);
+        head.ppq += block * 2.0 / 48000.0;
+    }
+    return rec.bend();
+}
+
+float loopSpike (int presetIndex, bool gap)
+{
+    const int block = 512, at = 96 * block, total = at + 64 * block;
+    const auto d = loopRender (presetIndex, true, gap, at, total);
+    const auto c = loopRender (presetIndex, false, false, at, total);
+    std::vector<float> ref (c.begin() + at / 3, c.begin() + at - 4800);
+    std::sort (ref.begin(), ref.end());
+    const float floorRef = ref[(size_t) (0.999 * (double) (ref.size() - 1))];
+    const float control = std::max (floorRef, sharpest (c, at - block - 16, at + 2400)) + 1.0e-6f;
+    return sharpest (d, at - block - 16, at + 2400) / control;
+}
+
+// A performance button switched on and off over sound, compared with the sound itself
+// once settled in each state (Shatter's cracks and grit, the input returning after
+// Seal are the design; a press must not be sharper than either settled state).
+// Shatter Time is set to 0.5 s (its default; presets go up to 8 s risers) so the
+// fully-shattered sound is reached and measured, and the ramp is at its steepest.
+float toggleSpike (int presetIndex, P button)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    const int block = 512, seg = 256 * block;   // ~2.7 s per state
+    proc.prepareToPlay (48000.0, block);
+    proc.presets.load (presetIndex);
+    setParam (proc, P::shatterTime, 0.5f);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    std::vector<int> at;
+    for (int k = 0; k < 5; ++k)
+    {
+        if (k > 0) { at.push_back ((int) rec.l.size()); setParam (proc, button, k % 2 == 1 ? 1.0f : 0.0f); }
+        for (int done = 0; done < seg; done += block)
+        {
+            tone.fill (buf);
+            proc.processBlock (buf, midi);
+            rec.add (buf);
+            head.ppq += block * 2.0 / 48000.0;
+        }
+    }
+    // Diagnostic: VX_DUMP=<file> VX_DUMP_TOGGLE=<preset index>seal|shatter writes the whole render
+    // (left channel, raw float32; toggles every 256 blocks).
+    if (const char* which = std::getenv ("VX_DUMP_TOGGLE"))
+        if (juce::String (which) == juce::String (presetIndex) + (button == P::seal ? "seal" : "shatter"))
+            if (auto* f = std::fopen (std::getenv ("VX_DUMP"), "wb"))
+            {
+                std::fwrite (rec.l.data(), sizeof (float), rec.l.size(), f);
+                std::fclose (f);
+            }
+    const auto d = rec.bend();
+    float worst = 0.0f;
+    for (size_t k = 0; k < at.size(); ++k)
+    {
+        const int a = at[k];
+        const float ref = std::max (sharpest (d, a - seg + 64 * block, a - block), sharpest (d, a + 64 * block, a + seg - block)) + 1.0e-6f;
+        const auto it = std::max_element (d.begin() + a - 16, d.begin() + a + 64 * block);
+        const float r = *it / ref;
+        worst = std::max (worst, r);
+        if (std::getenv ("VX_TOGGLE_DETAIL") != nullptr && r >= 1.25f)   // detail from 1.25 up
+            std::printf ("    preset %d %s %s: %.2f at %.1f ms\n", presetIndex, button == P::seal ? "Seal" : "Shatter",
+                         k % 2 == 0 ? "on" : "off", r, (double) (it - d.begin() - a) / 48.0);
+    }
+    return worst;
+}
+
+constexpr float kToggleLimit = 1.5f;
+
+// How long a sound change takes, from the preset load until the new sound is fully
+// in (fade to dry, hold, swap, fade in). README promises about 50 ms.
+int checkChangeTime()
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    const int block = 64;   // a small host block, so the time is measured finely
+    proc.prepareToPlay (48000.0, block);
+    proc.presets.load (1);
+    SoftTone tone;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    for (int b = 0; b < 200; ++b) { tone.fill (buf); proc.processBlock (buf, midi); }
+    proc.presets.load (5);
+    int samples = 0;
+    bool started = false;
+    for (int b = 0; b < 400; ++b)
+    {
+        tone.fill (buf);
+        proc.processBlock (buf, midi);
+        samples += block;
+        started = started || proc.getSoundTransition() > 0.0f;
+        if (started && proc.getSoundTransition() == 0.0f) break;
+    }
+    const double ms = samples / 48.0;
+    std::printf ("sound change time: %.1f ms from load to fully in (limit 64)\n", ms);
+    return started && ms <= 64.0 ? 0 : 1;
+}
+
+int checkStatic()
+{
+    int fails = checkChangeTime();
+    float worstChange = 0.0f;
+    fails += checkSoundChanges (worstChange);
+
+    VesselProcessor probe;
+    const auto& entries = probe.presets.getEntries();
+    float worstWrap = 0.0f, worstGap = 0.0f, worstSeal = 0.0f, worstShatter = 0.0f;
+    int wrapFails = 0, toggleFails = 0, presets = 0;
+    for (int i = 0; i < entries.size(); ++i)
+    {
+        if (entries[i].factoryIndex < 0) continue;
+        ++presets;
+        const float wrap = loopSpike (i, false), gap = loopSpike (i, true);
+        const float seal = toggleSpike (i, P::seal), shatter = toggleSpike (i, P::shatter);
+        worstWrap = std::max (worstWrap, wrap); worstGap = std::max (worstGap, gap);
+        worstSeal = std::max (worstSeal, seal); worstShatter = std::max (worstShatter, shatter);
+        // Toggles: 1.5, not 1.25. Their settled sounds vary up to ~1.2x between two
+        // stretches of themselves (Shatter's cracks, Noise excitation, shimmer), so 1.25
+        // would leave no margin; 1.5 is that spread plus the same 25%. (Seal and Shatter
+        // measured clean in 1.0.1 too: this is a guard against regressions.)
+        const bool badLoop = wrap >= 2.5f || gap >= 2.5f, badToggle = seal >= kToggleLimit || shatter >= kToggleLimit;
+        wrapFails += badLoop ? 1 : 0;
+        toggleFails += badToggle ? 1 : 0;
+        if (badLoop || badToggle || verboseStatic())
+            std::printf ("  %-4s %-22s wrap %6.2f  restart %6.2f  seal %6.2f  shatter %6.2f\n",
+                         badLoop || badToggle ? "FAIL" : "ok", entries[i].name.toRawUTF8(), wrap, gap, seal, shatter);
+    }
+    std::printf ("loops: %d of %d presets clicked, worst wrap %.2f, worst restart %.2f (limit 2.5)\n",
+                 wrapFails, presets, worstWrap, worstGap);
+    std::printf ("Seal/Shatter: %d of %d presets clicked, worst Seal %.2f, worst Shatter %.2f (limit 1.5)\n",
+                 toggleFails, presets, worstSeal, worstShatter);
+    fails += wrapFails + toggleFails;
+    std::printf ("%s\n", fails == 0 ? "STATIC CHECK PASSED" : "STATIC CHECK FAILED");
+    return fails == 0 ? 0 : 1;
+}
+
+// Diagnostic (not part of CI): switch preset `a` -> `b` over a held tone and report the
+// switch's bend ratio, then again with each stage forced off in both presets, so the
+// stage that makes a click stands out. VX_DUMP=<file> writes the left channel (raw
+// float32, from 0.3 s before the switch) of the all-stages render.
+float pairRatio (int a, int b, int stageOff, double& peakMs)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    const int block = 512, segment = 144 * block;
+    proc.prepareToPlay (48000.0, block);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    auto play = [&] (int samples)
+    {
+        for (int done = 0; done < samples; done += block)
+        {
+            tone.fill (buf);
+            proc.processBlock (buf, midi);
+            rec.add (buf);
+            head.ppq += block * 2.0 / 48000.0;
+        }
+    };
+    auto load = [&] (int i)
+    {
+        proc.presets.load (i);
+        if (stageOff >= 0) setParam (proc, kStages[stageOff].on, 0.0f);
+    };
+    load (a);
+    const auto from = proc.getPatchState();
+    play (segment);
+    const int at = (int) rec.l.size();
+    load (b);
+    const auto to = proc.getPatchState();
+    play (segment);
+    const auto d = rec.bend();
+    const float ref = std::max (soloSharpness (from), soloSharpness (to)) + 1.0e-6f;
+    const auto it = std::max_element (d.begin() + at - 16, d.begin() + at + segment - block);
+    peakMs = (double) (it - d.begin() - at) / 48.0;
+    if (stageOff < 0)
+        if (const char* dump = std::getenv ("VX_DUMP"))
+            if (auto* f = std::fopen (dump, "wb"))
+            {
+                std::fwrite (rec.l.data() + at - 14400, sizeof (float), 14400 + (size_t) segment, f);
+                std::fclose (f);
+            }
+    return *it / ref;
+}
+
+int staticPair (int a, int b)
+{
+    VesselProcessor probe;
+    const auto& e = probe.presets.getEntries();
+    if (! juce::isPositiveAndBelow (a, e.size()) || ! juce::isPositiveAndBelow (b, e.size())) return 2;
+    double ms = 0.0;
+    std::printf ("%s -> %s\n", e[a].name.toRawUTF8(), e[b].name.toRawUTF8());
+    const float all = pairRatio (a, b, -1, ms);
+    std::printf ("  all stages         %6.2f at %5.1f ms\n", all, ms);
+    for (int s = 0; s < kNumStages; ++s)
+    {
+        const float r = pairRatio (a, b, s, ms);
+        std::printf ("  without %-10s %6.2f at %5.1f ms\n", kStages[s].name, r, ms);
+    }
+    return 0;
+}
+
+// Diagnostic (not part of CI): which settings make switch a -> b click? Applies preset a,
+// then a patch that has only some of b's changed values (through applyPatchState, like
+// a real preset load), and narrows that set down. Usage: vessel_check static-bisect <a> <b>
+float subsetRatio (const juce::ValueTree& ta, const juce::ValueTree& tb, const std::vector<juce::String>& ids, bool matrix)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    const int block = 512, segment = 48 * block;
+    proc.prepareToPlay (48000.0, block);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    auto play = [&] (int samples)
+    {
+        for (int done = 0; done < samples; done += block)
+        {
+            tone.fill (buf);
+            proc.processBlock (buf, midi);
+            rec.add (buf);
+            head.ppq += block * 2.0 / 48000.0;
+        }
+    };
+    proc.applyPatchState (ta.createCopy(), true);
+    play (segment);
+    auto mixed = ta.createCopy();
+    for (const auto& id : ids)
+        mixed.getChildWithProperty ("id", id).setProperty ("value", tb.getChildWithProperty ("id", id).getProperty ("value"), nullptr);
+    if (matrix)
+    {
+        auto m = mixed.getChildWithName ("MATRIX");
+        m.copyPropertiesAndChildrenFrom (tb.getChildWithName ("MATRIX"), nullptr);
+    }
+    const int at = (int) rec.l.size();
+    proc.applyPatchState (mixed, true);
+    play (segment);
+    const auto d = rec.bend();
+    const float ref = std::max (sharpest (d, at - segment + 8 * block, at - block),
+                                sharpest (d, at + 12 * block, at + segment - block)) + 1.0e-6f;
+    return sharpest (d, at - 16, at + 12 * block) / ref;
+}
+
+// A preset index, or a Pour Me patch when negative (-seed).
+juce::ValueTree patchFor (VesselProcessor& probe, int which)
+{
+    if (which >= 0) probe.presets.load (which);
+    else probe.presets.randomize ((std::uint32_t) -which);
+    return probe.getPatchState();
+}
+
+int staticBisect (int a, int b)
+{
+    VesselProcessor probe;
+    const auto ta = patchFor (probe, a);
+    const auto tb = patchFor (probe, b);
+    std::vector<juce::String> diff;
+    for (int i = 0; i < kNumParams; ++i)
+    {
+        const juce::String id (def (i).id);
+        if ((float) ta.getChildWithProperty ("id", id).getProperty ("value") != (float) tb.getChildWithProperty ("id", id).getProperty ("value"))
+            diff.push_back (id);
+    }
+    std::printf ("%d settings differ; all + matrix: %.2f, settings only: %.2f, matrix only: %.2f\n", (int) diff.size(),
+                 subsetRatio (ta, tb, diff, true), subsetRatio (ta, tb, diff, false), subsetRatio (ta, tb, {}, true));
+    // Greedy: drop each setting in turn while the switch still clicks.
+    auto set = diff;
+    const bool withMatrix = subsetRatio (ta, tb, set, false) < 1.25f;
+    for (size_t k = 0; k < set.size();)
+    {
+        auto trial = set;
+        trial.erase (trial.begin() + (long) k);
+        if (subsetRatio (ta, tb, trial, withMatrix) >= 1.25f) set = trial; else ++k;
+    }
+    std::printf ("smallest clicking set (%s matrix): ", withMatrix ? "with" : "without");
+    for (const auto& id : set) std::printf ("%s ", id.toRawUTF8());
+    std::printf ("-> %.2f\n", subsetRatio (ta, tb, set, withMatrix));
+    for (const auto& id : set)
+        std::printf ("  %-14s %s -> %s\n", id.toRawUTF8(), ta.getChildWithProperty ("id", id).getProperty ("value").toString().toRawUTF8(),
+                     tb.getChildWithProperty ("id", id).getProperty ("value").toString().toRawUTF8());
+    return 0;
+}
+
+// Diagnostic (not part of CI): Seal and Shatter scores for one preset.
+int toggleOne (int presetIndex)
+{
+    std::printf ("seal %.2f  shatter %.2f\n", toggleSpike (presetIndex, P::seal), toggleSpike (presetIndex, P::shatter));
+    return 0;
+}
+
+// Diagnostic (not part of CI): render preset <i> over the soft tone for 3 s, with no
+// changes, and write the left channel (raw float32) to <file>. Used to null-test that a
+// settled preset sounds the same between two versions.
+int renderOne (int presetIndex, const char* file)
+{
+    VesselProcessor proc;
+    TestPlayHead head;
+    head.playing = true;
+    proc.setPlayHead (&head);
+    proc.presets.load (presetIndex);       // before playback starts: not a sound change
+    proc.prepareToPlay (48000.0, 512);
+    SoftTone tone;
+    Recorder rec;
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, 512);
+    for (int b = 0; b < 282; ++b)
+    {
+        tone.fill (buf);
+        proc.processBlock (buf, midi);
+        rec.add (buf);
+        head.ppq += 512 * 2.0 / 48000.0;
+    }
+    if (auto* f = std::fopen (file, "wb"))
+    {
+        std::fwrite (rec.l.data(), sizeof (float), rec.l.size(), f);
+        std::fclose (f);
+    }
+    return 0;
+}
+
 } // namespace
 
 int main (int argc, char** argv)
@@ -356,7 +928,16 @@ int main (int argc, char** argv)
                          argc > 5 ? juce::String (argv[5]).getIntValue() : -1);
     if (mode == "presets") return checkPresets();
     if (mode == "state")   return checkState();
+    if (mode == "static")  return checkStatic();
+    if (mode == "static-pair" && argc > 3)
+        return staticPair (juce::String (argv[2]).getIntValue(), juce::String (argv[3]).getIntValue());
+    if (mode == "static-render" && argc > 3)
+        return renderOne (juce::String (argv[2]).getIntValue(), argv[3]);
+    if (mode == "static-toggle" && argc > 2)
+        return toggleOne (juce::String (argv[2]).getIntValue());
+    if (mode == "static-bisect" && argc > 3)
+        return staticBisect (juce::String (argv[2]).getIntValue(), juce::String (argv[3]).getIntValue());
 
-    std::printf ("usage: vessel_check snapshot <out.png> [width] [easy|vessel|fx|mod|global] [preset] | presets | state\n");
+    std::printf ("usage: vessel_check snapshot <out.png> [width] [easy|vessel|fx|mod|global] [preset] | presets | state | static | static-pair <a> <b>\n");
     return 2;
 }

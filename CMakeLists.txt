@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(Vessel VERSION 1.0.1 LANGUAGES C CXX)
+project(Vessel VERSION 1.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,7 +65,7 @@ if(VESSEL_BUILD_TESTS)
     FetchContent_MakeAvailable(Catch2)
 
     enable_testing()
-    add_executable(vessel_tests tests/DspTests.cpp tests/ChainTests.cpp)
+    add_executable(vessel_tests tests/DspTests.cpp tests/ChainTests.cpp tests/StaticTests.cpp)
     target_link_libraries(vessel_tests PRIVATE vessel_dsp Catch2::Catch2WithMain)
     add_test(NAME dsp COMMAND vessel_tests)
 endif()

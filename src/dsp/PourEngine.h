@@ -56,6 +56,14 @@ public:
         }
     }
 
+    // During a sound change the input fades out and back in. Mode 1 (fading out, old
+    // sound still heard): the slow envelope holds, so it does not fall with the fade.
+    // Mode 2 (from the swap, output fully dry, through the fade-in): it may also rise
+    // with the fast one. The returning input, at whatever level the new sound brings,
+    // is then never mistaken for a new hit (that pinged the body on every preset
+    // change, Nov 2026). Rising only after the swap keeps the old sound untouched.
+    void setDetectorMode (int mode) noexcept { detectorMode = mode; }
+
     void process (float* L, float* R, int n, const Transport&) noexcept override
     {
         float* io[2] = { L, R };
@@ -71,7 +79,10 @@ public:
             // Transient gain from the gap between a fast and a slow envelope (linked).
             const float a = std::max (std::abs (io[0][i]), std::abs (io[1][i]));
             fast[0] = a > fast[0] ? a + aFast * (fast[0] - a) : a + rFast * (fast[0] - a);
-            slow[0] = a > slow[0] ? a + aSlow * (slow[0] - a) : a + rSlow * (slow[0] - a);
+            if (detectorMode == 0)
+                slow[0] = a > slow[0] ? a + aSlow * (slow[0] - a) : a + rSlow * (slow[0] - a);
+            else if (detectorMode == 2)
+                slow[0] = std::max (slow[0], fast[0]);   // after the swap: may only rise (see setDetectorMode)
             const float ratio = (fast[0] + 1.0e-5f) / (slow[0] + 1.0e-5f);   // > 1 on attacks
             const float shape = std::clamp (std::log2 (ratio), -1.0f, 2.0f);
             const float tGain = dbToGain (std::clamp (strike * shape * 9.0f, -12.0f, 12.0f));
@@ -86,7 +97,12 @@ public:
             for (int c = 0; c < 2; ++c)
             {
                 float x = io[c][i];
-                if (cut > 21.0f) x = lowCut[c].highpass (x);
+                // Low Cut fades out between 30 and 20 Hz rather than switching off at
+                // one sample (a hard bypass at 21 Hz clicked whenever the cut was swept
+                // down to off, by hand or by a preset, Nov 2026). The filter keeps running
+                // so its state is ready; at 20 Hz (off) the signal passes bit-exact.
+                const float hp = lowCut[c].highpass (x);
+                if (cut > 20.0f) x += std::min (1.0f, (cut - 20.0f) * 0.1f) * (hp - x);
                 const float lo = tiltSplit[c].lowpass (x);
                 x = lo * loG + (x - lo) * hiG;
                 x *= tGain;
@@ -106,6 +122,7 @@ private:
     float fast[2] {}, slow[2] {};
     float aFast = 0, rFast = 0, aSlow = 0, rSlow = 0, driveNorm = 1.0f;
     bool primed = false;
+    int detectorMode = 0;
 };
 
 } // namespace vessel::dsp

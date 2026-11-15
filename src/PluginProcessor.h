@@ -13,6 +13,7 @@
 #include "dsp/ModSources.h"
 #include "dsp/OutputStage.h"
 #include "presets/PresetManager.h"
+#include "state/SoundChangeGate.h"
 #include "state/StateGuard.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -98,6 +99,8 @@ public:
     // For tests / tools: the effective value of a parameter after modulation and Shatter.
     float effectiveValue (P p) const noexcept { return eff[(size_t) idx (p)]; }
     const dsp::Chain& getChain() const noexcept { return chain; }
+    // For tests / tools: 0 = the sound is fully in, 1 = fully faded to dry for a sound change.
+    float getSoundTransition() const noexcept { return transition; }
 
 private:
     void valueTreePropertyChanged (juce::ValueTree& t, const juce::Identifier&) override
@@ -115,6 +118,9 @@ private:
     void setParamReal (int i, float real);
 
     void runControl (int len, float inPeak, const dsp::Transport& t);
+    void takeSound() noexcept;          // read every parameter and matrix slot (audio thread)
+    void updateSound() noexcept;        // sound-change gate: hold, fade, swap (see SoundChangeGate.h)
+    float advanceTransition() noexcept; // one sample of the sound-change crossfade
     void pushEngineParams (const dsp::Transport& t, int len);
 
     struct SlotAtomic
@@ -130,6 +136,9 @@ private:
     std::array<juce::NormalisableRange<float>, kNumParams> ranges;
 
     // Audio-thread working state.
+    std::array<float, kNumParams> cur {};      // parameter values in use (held during a sound change)
+    struct SlotValue { int src = 0, dst = -1; float amount = 0.0f; };
+    std::array<SlotValue, kMatrixSlots> slotCur {};
     std::array<float, kNumParams> eff {};      // effective real values for this block
     std::array<float, kNumParams> norm {};     // effective normalised values
     dsp::Chain chain;
@@ -140,9 +149,23 @@ private:
     float srcVal[kNumSources] {};
     float shatterRamp = 0.0f;
     double freePpq = 0.0;
+    float lastOutPeak = 0.0f;       // last block's output peak: is there sound to protect?
     double sampleRateHz = 48000.0;
     juce::AudioBuffer<float> dry;
     dsp::Smoother inGainS;
+
+    // Sound changes (preset, Pour Me, A/B, project load): every one opens a gate scope
+    // in applyPatchState. The audio thread keeps the old sound and fades both the
+    // output (to the dry input) and the effect's input (to silence) over 10 ms, holds
+    // 10 ms, takes every new value at once, then fades back in over 30 ms.
+    lowkei::SoundChangeGate soundGate;
+    std::uint32_t seenSoundChange = 0;
+    bool holdingSound = false;
+    float transition = 0.0f, transitionTarget = 0.0f;
+    float transitionOut = 0.0f, transitionIn = 0.0f;
+    int swapHold = 0, swapHoldSamples = 480;
+    int settleLeft = 0, settleSamples = 7200;   // detectors stay rise-only this long after the fade-in
+    static constexpr float kSwapHoldMs = 10.0f;
 
     JUCE_DECLARE_WEAK_REFERENCEABLE (VesselProcessor)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VesselProcessor)

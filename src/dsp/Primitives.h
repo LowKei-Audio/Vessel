@@ -42,6 +42,52 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Eases a cyclic position (in cycles) across a jump instead of snapping to it.
+// Synced LFOs and the Liquid slosh read the host's playhead; a loop wrap or a
+// restart over sound moves it in one sample, which was heard as a click
+// (Serato report, Nov 2026). After arm(), the next block measures how far the
+// new position is from where the old one was heading (the shortest way round)
+// and glides that offset out (~15 ms). The returned per-sample increment
+// includes the glide, so the position is continuous inside a block as well.
+// Not armed: exact pass-through, so playback from silence matches a bounce.
+class PhaseGlide
+{
+public:
+    void reset() noexcept { offset = expected = 0.0; armed = primed = false; }
+    void arm() noexcept   { armed = true; }
+    // Glide from `pos` (where the old clock was heading) on the next block, even if this
+    // glide was not running before (a free clock switched to synced).
+    void continueFrom (double pos) noexcept { expected = pos; primed = armed = true; }
+    bool isGliding() const noexcept { return offset != 0.0; }
+
+    // pos / inc: the true position at the block start and its step per sample.
+    // Returns the eased position; incOut receives the eased step for this block.
+    double process (double pos, double inc, int n, double sampleRate, double& incOut,
+                    double tauSeconds = 0.015) noexcept
+    {
+        if (armed && primed)
+        {
+            double d = expected - pos;
+            d -= std::round (d);                       // -0.5..0.5 cycles
+            offset = std::abs (d) > 1.0e-7 ? d : 0.0;
+        }
+        armed = false;
+        const double out = pos + offset;
+        double next = offset * std::exp (-(double) n / std::max (1.0, sampleRate * tauSeconds));
+        if (std::abs (next) < 1.0e-7) next = 0.0;
+        incOut = inc + (next - offset) / std::max (1, n);
+        expected = out + incOut * n;
+        offset = next;
+        primed = true;
+        return out;
+    }
+
+private:
+    double offset = 0.0, expected = 0.0;
+    bool armed = false, primed = false;
+};
+
+// ---------------------------------------------------------------------------
 // Topology-preserving one-pole: stable under fast cutoff changes.
 class OnePole
 {

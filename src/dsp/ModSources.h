@@ -32,7 +32,9 @@ class ModLfo
 {
 public:
     void setIndex (int i) noexcept { index = (std::uint32_t) i; }
-    void reset() noexcept { freePhase = 0.0; value = 0.0f; }
+    void reset() noexcept { freePhase = 0.0; value = 0.0f; glide.reset(); }
+    // The host playhead jumped over sound: ease a synced LFO onto the new position.
+    void armGlide() noexcept { glide.arm(); }
 
     // Advance by `samples` and return the value (-1..1) for this block.
     float advance (const LfoParams& p, const Transport& t, int samples, std::uint32_t seed) noexcept
@@ -40,10 +42,13 @@ public:
         double pos;   // position in cycles
         if (p.sync)
         {
-            pos = t.ppq / divisionBeats (p.division);
+            const double beats = divisionBeats (p.division);
+            double unusedInc = 0.0;   // the LFO is read once per control block
+            pos = glide.process (t.ppq / beats, t.beatsPerSample() / beats, samples, t.sampleRate, unusedInc);
         }
         else
         {
+            glide.reset();
             freePhase += (double) std::clamp (p.rateHz, 0.001f, 100.0f) * samples / t.sampleRate;
             pos = freePhase;
         }
@@ -78,6 +83,7 @@ public:
 private:
     std::uint32_t index = 0;
     double freePhase = 0.0;
+    PhaseGlide glide;
     float value = 0.0f;
 };
 

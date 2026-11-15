@@ -90,6 +90,11 @@ jobs:
           ./build/vessel_check_artefacts/Release/vessel_check.exe presets | tee presets.log
           echo "::notice title=Factory presets::$(grep 'preset(s) failed' presets.log)"
 
+      - name: Static check (clicks on preset switches, loops, Seal and Shatter)
+        run: |
+          ./build/vessel_check_artefacts/Release/vessel_check.exe static | tee static.log
+          echo "::notice title=Static check::$(grep -E '^sound changes' static.log) | $(grep -E '^loops' static.log) | $(grep -E '^Seal/Shatter' static.log)"
+
       - name: UI snapshots (Windows font rendering)
         run: |
           mkdir -p screenshots

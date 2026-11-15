@@ -65,20 +65,31 @@ bool VesselProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 void VesselProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sampleRateHz = sampleRate;
+    takeSound();
+    seenSoundChange = soundGate.current();   // a change made while stopped is simply current now
+    holdingSound = false;
+    transition = transitionTarget = 0.0f;
+    transitionOut = (float) (1.0 / (0.010 * sampleRate));   // fade to dry in 10 ms
+    transitionIn  = (float) (1.0 / (0.030 * sampleRate));   // back in over 30 ms
+    swapHoldSamples = (int) std::lround (sampleRate * kSwapHoldMs * 0.001);
+    swapHold = 0;
+    settleSamples = (int) std::lround (sampleRate * 0.150);
+    settleLeft = 0;
     chain.prepare (sampleRate, kControlBlock);
     output.prepare (sampleRate);
     inGainS.prepare (sampleRate, 20.0f);
-    inGainS.snapTo (Decibels::decibelsToGain (raw[(size_t) idx (P::inGain)]->load()));
+    inGainS.snapTo (Decibels::decibelsToGain (cur[(size_t) idx (P::inGain)]));
     dry.setSize (2, samplesPerBlock);
     for (auto& l : lfos) l.reset();
     env.reset();
     drift.reset();
     shatterRamp = 0.0f;
+    lastOutPeak = 0.0f;
 
     // Prime every engine with the current settings so nothing glides from zero.
     dsp::Transport t;
     t.sampleRate = sampleRate;
-    t.bpm = raw[(size_t) idx (P::tempo)]->load();
+    t.bpm = cur[(size_t) idx (P::tempo)];
     runControl (kControlBlock, 0.0f, t);
 }
 
@@ -195,6 +206,7 @@ ValueTree VesselProcessor::getPatchState() const
 void VesselProcessor::applyPatchState (const ValueTree& src, bool notifyHost)
 {
     if (! src.hasType (stateGuard.stateType())) return;
+    lowkei::SoundChangeGate::Scope change (soundGate);   // a new sound: fade, swap, fade
 
     if (! notifyHost)
     {
@@ -269,54 +281,107 @@ void VesselProcessor::setStateInformation (const void* data, int sizeInBytes)
 AudioProcessorEditor* VesselProcessor::createEditor() { return new VesselEditor (*this); }
 
 // ---------------------------------------------------------------------------
+// Sound changes (Serato static report, Nov 2026; same pattern as Starfire 1.0.4).
+void VesselProcessor::takeSound() noexcept
+{
+    for (int i = 0; i < kNumParams; ++i) cur[(size_t) i] = raw[(size_t) i]->load (std::memory_order_relaxed);
+    for (int i = 0; i < kMatrixSlots; ++i)
+    {
+        const auto& a = slotsA[(size_t) i];
+        slotCur[(size_t) i] = { a.src.load (std::memory_order_relaxed), a.dst.load (std::memory_order_relaxed),
+                                a.amount.load (std::memory_order_relaxed) };
+    }
+}
+
+void VesselProcessor::updateSound() noexcept
+{
+    // A preset, Pour Me, A/B or project load started or finished since the last swap:
+    // keep the old settings and fade first, rather than letting a block play half-old,
+    // half-new settings or retune a ringing body in one sample.
+    const auto change = soundGate.current();
+    if (! holdingSound && change != seenSoundChange)
+    {
+        holdingSound = true;
+        transitionTarget = 1.0f;
+    }
+    if (! holdingSound) { takeSound(); return; }
+
+    if (! soundGate.busy() && transition >= 1.0f && swapHold >= swapHoldSamples)
+    {
+        // Fully dry, the effect's input silent for 10 ms and every value written: take
+        // the whole new sound at once. Tails are kept on purpose (Starfire measured that
+        // clearing them clicks on the way back in); the gain stages snap, unheard.
+        seenSoundChange = change;
+        holdingSound = false;
+        takeSound();
+        inGainS.snapTo (Decibels::decibelsToGain (cur[(size_t) idx (P::inGain)]));
+        output.snapOnNextParams();
+        chain.bodyE.beginSoundChange();
+        chain.echoE.jumpOnNextParams();
+        chain.spaceE.jumpOnNextParams();
+        transitionTarget = 0.0f;
+    }
+}
+
+// One sample of the sound-change crossfade. Returns the S-curve amount (0 = sound,
+// 1 = dry). An S-curve, not a straight line: a linear fade's corners are a small tick.
+float VesselProcessor::advanceTransition() noexcept
+{
+    if (transition != transitionTarget)
+        transition = transitionTarget > transition ? std::min (transitionTarget, transition + transitionOut)
+                                                   : std::max (transitionTarget, transition - transitionIn);
+    swapHold = transition >= 1.0f ? std::min (swapHold + 1, swapHoldSamples) : 0;
+    return transition * transition * (3.0f - 2.0f * transition);
+}
+
+// ---------------------------------------------------------------------------
 // Control block: sources -> matrix -> Shatter -> effective values -> engines.
 void VesselProcessor::runControl (int len, float inPeak, const dsp::Transport& t)
 {
-    const auto seed = (std::uint32_t) raw[(size_t) idx (P::seed)]->load();
+    const auto seed = (std::uint32_t) cur[(size_t) idx (P::seed)];
 
     for (int i = 0; i < kNumParams; ++i)
-        norm[(size_t) i] = ranges[(size_t) i].convertTo0to1 (raw[(size_t) i]->load());
+        norm[(size_t) i] = ranges[(size_t) i].convertTo0to1 (cur[(size_t) i]);
 
     // Sources (LFO / Drift rates use last block's modulated values).
     for (int l = 0; l < 2; ++l)
     {
         const int base = idx (P::lfo1Shape) + l * 4;
         dsp::LfoParams lp;
-        lp.shape = (dsp::LfoShape) (int) raw[(size_t) base]->load();
-        lp.rateHz = eff[(size_t) base + 1] > 0.0f ? eff[(size_t) base + 1] : raw[(size_t) base + 1]->load();
-        lp.sync = raw[(size_t) base + 2]->load() > 0.5f;
-        lp.division = (int) raw[(size_t) base + 3]->load();
+        lp.shape = (dsp::LfoShape) (int) cur[(size_t) base];
+        lp.rateHz = eff[(size_t) base + 1] > 0.0f ? eff[(size_t) base + 1] : cur[(size_t) base + 1];
+        lp.sync = cur[(size_t) base + 2] > 0.5f;
+        lp.division = (int) cur[(size_t) base + 3];
         srcVal[(int) Src::lfo1 + l] = lfos[l].advance (lp, t, len, seed);
     }
     {
-        dsp::EnvParams ep { raw[(size_t) idx (P::envAttack)]->load(), raw[(size_t) idx (P::envRelease)]->load(),
-                            raw[(size_t) idx (P::envGain)]->load() };
+        dsp::EnvParams ep { cur[(size_t) idx (P::envAttack)], cur[(size_t) idx (P::envRelease)],
+                            cur[(size_t) idx (P::envGain)] };
         srcVal[(int) Src::env] = env.advance (ep, inPeak, len, sampleRateHz);
     }
     {
-        const float rate = eff[(size_t) idx (P::driftRate)] > 0.0f ? eff[(size_t) idx (P::driftRate)] : raw[(size_t) idx (P::driftRate)]->load();
-        dsp::ChaosParams cp { rate, raw[(size_t) idx (P::driftSmooth)]->load() };
+        const float rate = eff[(size_t) idx (P::driftRate)] > 0.0f ? eff[(size_t) idx (P::driftRate)] : cur[(size_t) idx (P::driftRate)];
+        dsp::ChaosParams cp { rate, cur[(size_t) idx (P::driftSmooth)] };
         srcVal[(int) Src::drift] = drift.advance (cp, len, sampleRateHz, seed);
     }
     for (int k = 0; k < kNumMacros; ++k)
         srcVal[(int) Src::macro1 + k] = norm[(size_t) idx (P::macro1) + (size_t) k];
 
     // Matrix.
-    for (auto& s : slotsA)
+    for (const auto& s : slotCur)
     {
-        const int dst = s.dst.load (std::memory_order_relaxed), src = s.src.load (std::memory_order_relaxed);
-        if (dst < 0 || src == 0) continue;
-        norm[(size_t) dst] += s.amount.load (std::memory_order_relaxed) * srcVal[src];
+        if (s.dst < 0 || s.src == 0) continue;
+        norm[(size_t) s.dst] += s.amount * srcVal[s.src];
     }
 
     // Shatter: a smooth ramp in (Shatter Time), a quick fall back out.
-    const bool shatterOn = raw[(size_t) idx (P::shatter)]->load() > 0.5f;
-    const float sTime = std::max (0.02f, raw[(size_t) idx (P::shatterTime)]->load());
+    const bool shatterOn = cur[(size_t) idx (P::shatter)] > 0.5f;
+    const float sTime = std::max (0.02f, cur[(size_t) idx (P::shatterTime)]);
     const float step = (float) len / (float) sampleRateHz;
     shatterRamp = shatterOn ? std::min (1.0f, shatterRamp + step / sTime)
                             : std::max (0.0f, shatterRamp - step / std::min (sTime, 0.3f));
     const float sr = shatterRamp * shatterRamp * (3.0f - 2.0f * shatterRamp);   // smoothstep
-    const float sh = sr * raw[(size_t) idx (P::shatterDepth)]->load();
+    const float sh = sr * cur[(size_t) idx (P::shatterDepth)];
     if (sh > 0.0f)
         for (const auto& m : kShatter) norm[(size_t) idx (m.p)] += sh * m.amount;
     uiShatter.store (sr, std::memory_order_relaxed);
@@ -332,7 +397,7 @@ void VesselProcessor::runControl (int len, float inPeak, const dsp::Transport& t
         }
         else
         {
-            eff[(size_t) i] = raw[(size_t) i]->load();
+            eff[(size_t) i] = cur[(size_t) i];
             norm[(size_t) i] = ranges[(size_t) i].convertTo0to1 (eff[(size_t) i]);
         }
     }
@@ -347,7 +412,7 @@ void VesselProcessor::runControl (int len, float inPeak, const dsp::Transport& t
     };
     forceIn (P::frOn, P::frMix, sh);
     forceIn (P::ecOn, P::ecMix, 0.35f * sh);
-    if (raw[(size_t) idx (P::frOn)]->load() > 0.5f)
+    if (cur[(size_t) idx (P::frOn)] > 0.5f)
     {
         auto& fm = eff[(size_t) idx (P::frMix)];
         fm = fm + sh * (1.0f - fm);
@@ -448,7 +513,7 @@ void VesselProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
 
     // Tempo and position. When the host is stopped (or sends nothing, as in
     // the standalone app) a free-running clock keeps synced effects moving.
-    double bpm = raw[(size_t) idx (P::tempo)]->load();
+    double bpm = cur[(size_t) idx (P::tempo)];
     bool playing = false;
     double hostPpq = 0.0;
     bool hasPpq = false;
@@ -468,12 +533,23 @@ void VesselProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
     t.playing = playing && hasPpq;
     t.ppq = t.playing ? hostPpq : freePpq;
 
+    // Playhead jumps: a loop wrapping round, a locate, or play starting somewhere other
+    // than where the clock was heading (the free clock keeps running while stopped).
+    // More than ~1.3 ms away is a real jump; host rounding and tempo ramps stay far
+    // below that. Over sound, synced LFOs and the slosh ease onto the new position
+    // instead of snapping (heard as a click on every loop in Serato). From silence they
+    // land exactly on the grid, so playback still matches a bounce.
+    if (t.playing && std::abs (t.ppq - freePpq) > 64.0 * t.beatsPerSample() && lastOutPeak > 1.0e-4f)
+    {
+        for (auto& l : lfos) l.armGlide();
+        chain.armGlide();
+    }
+
     // Mono runs as dual-mono through the second scratch channel.
     if (dry.getNumSamples() < n) dry.setSize (2, n, false, false, true);   // host exceeded its block size
     float* L = buffer.getWritePointer (0);
     float* R = numOut >= 2 ? buffer.getWritePointer (1) : nullptr;
 
-    inGainS.setTarget (Decibels::decibelsToGain (raw[(size_t) idx (P::inGain)]->load()));
     float inPeakBlock = 0.0f, outPeak = 0.0f, grMin = 1.0f;
 
     for (int start = 0; start < n; start += kControlBlock)
@@ -484,22 +560,50 @@ void VesselProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
         float* r = R != nullptr ? R + start : monoR;
         if (R == nullptr) std::copy (l, l + len, monoR);
 
-        // Input gain, then keep the dry reference for Mix / Delta.
+        updateSound();
+        inGainS.setTarget (Decibels::decibelsToGain (cur[(size_t) idx (P::inGain)]));
+
+        // Sound-change crossfade for this control block (all zeros when none is running).
+        float fade[kControlBlock], inL[kControlBlock], inR[kControlBlock];
+        bool fading = false;
+        for (int k = 0; k < len; ++k)
+        {
+            fade[k] = advanceTransition();
+            fading = fading || fade[k] > 0.0f;
+        }
+
+        // Input gain, then keep the dry reference for Mix / Delta. During a sound change
+        // the effect's input fades with the output, so the swap happens on silence and
+        // no delay line or reverb records the jump (it would replay it later).
         float pk = 0.0f;
         float* dl = dry.getWritePointer (0, start);
         float* dr = dry.getWritePointer (1, start);
         for (int k = 0; k < len; ++k)
         {
+            inL[k] = l[k]; inR[k] = r[k];
             const float g = inGainS.next();
             l[k] *= g; r[k] *= g;
             dl[k] = l[k]; dr[k] = r[k];
             pk = std::max ({ pk, std::abs (l[k]), std::abs (r[k]) });
+            if (fading) { const float feed = 1.0f - fade[k]; l[k] *= feed; r[k] *= feed; }
         }
         inPeakBlock = std::max (inPeakBlock, pk);
 
         runControl (len, pk, t);
+        // Detectors: hold while fading out; from the swap, rise-only through the fade-in
+        // and 150 ms beyond it, while the new settings' own smoothers are still gliding
+        // (a level still rising after the fade read as a hit, Nov 2026).
+        if (transition > 0.0f && ! holdingSound) settleLeft = settleSamples;
+        else if (settleLeft > 0) settleLeft = std::max (0, settleLeft - len);
+        chain.setDetectorMode (holdingSound ? 1 : (transition > 0.0f || settleLeft > 0) ? 2 : 0);
         chain.process (l, r, len, t);
         output.process (dl, dr, l, r, len);
+        if (fading)
+            for (int k = 0; k < len; ++k)
+            {
+                l[k] += (inL[k] - l[k]) * fade[k];
+                r[k] += (inR[k] - r[k]) * fade[k];
+            }
         grMin = std::min (grMin, output.gainReduction());
         t.ppq += t.beatsPerSample() * len;
 
@@ -508,6 +612,7 @@ void VesselProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
             for (int k = 0; k < len; ++k) l[k] = 0.5f * (l[k] + r[k]);
     }
     freePpq = t.ppq;
+    lastOutPeak = outPeak;
 
     uiInPeak.store (inPeakBlock, std::memory_order_relaxed);
     uiOutPeak.store (outPeak, std::memory_order_relaxed);

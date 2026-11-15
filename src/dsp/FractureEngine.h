@@ -70,6 +70,12 @@ public:
         }
     }
 
+    // During a sound change (the fade and the 150 ms the new sound settles) no new
+    // crack starts; one already ringing finishes. Cracks are events the sound
+    // triggers, and a body still ringing up after a switch set off cracks bigger than
+    // the settled sound ever makes (Nov 2026).
+    void setHoldCracks (bool hold) noexcept { holdCracks = hold; }
+
     void process (float* L, float* R, int n, const Transport&) noexcept override
     {
         float* io[2] = { L, R };
@@ -82,7 +88,7 @@ public:
 
             // Crack events: denser and louder the more signal is coming in, and
             // none at all in silence (Fracture never makes noise on its own).
-            if (crack > 1.0e-3f && env > 1.0e-4f && noise.next01() < crack * crack * 0.0025f * (0.15f + 6.0f * env))
+            if (! holdCracks && crack > 1.0e-3f && env > 1.0e-4f && noise.next01() < crack * crack * 0.0025f * (0.15f + 6.0f * env))
             {
                 const float f = 1500.0f + 7500.0f * noise.next01();
                 for (int c = 0; c < 2; ++c)
@@ -159,6 +165,7 @@ private:
     Svf crackFilter[2];
     Noise noise;
     bool primed = false;
+    bool holdCracks = false;
 };
 
 } // namespace vessel::dsp
